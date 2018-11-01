@@ -20,7 +20,7 @@
 
 #define SND_SOC_TPLG_INDEX_ALL  0
 
-struct reader {
+struct tplgreader {
 	const char *in_file;
 	const char *out_file;
 	FILE *in_fd;
@@ -715,7 +715,7 @@ static int tplg_process_headers(struct soc_tplg *tplg)
 	return ret;
 }
 
-static int read_tplg_file(struct reader *reader)
+static int read_tplg_file(struct tplgreader *reader)
 {
 	struct soc_tplg tplg;
 	int ret = 0;
@@ -759,8 +759,10 @@ static void usage(char *name)
 
 int main(int argc, char *argv[])
 {
-	struct reader reader;
+	struct tplgreader reader;
 	int opt, ret, i, binary = 0;
+	reader.in_file = NULL;
+	reader.out_file = NULL;
 
 	while ((opt = getopt(argc, argv, "hi:o:")) != -1) {
 		switch (opt) {
