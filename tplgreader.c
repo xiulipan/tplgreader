@@ -20,11 +20,59 @@
 
 #define SND_SOC_TPLG_INDEX_ALL  0
 
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+
+#define SNDRV_PCM_FMTBIT_S16_LE  	(1 << 2)
+#define SNDRV_PCM_FMTBIT_S24_LE		(1 << 6)
+#define SNDRV_PCM_FMTBIT_S32_LE		(1 << 10)
+#define SNDRV_PCM_FMTBIT_FLOAT		(1 << 14)
+
+#define DEBUG 0
+
+#if DEBUG
+#define dprintf(...)  printf(__VA_ARGS__)
+#else
+#define dprintf(...)
+#endif
+
+struct plist {
+	void* ptrs[20];
+	int n;
+};
+
+static void list_init(struct plist *list)
+{
+	    list->n = 0;
+}
+
+static void list_append(struct plist* list, void *ptr)
+{
+	list->ptrs[list->n++] = ptr;
+}
+
+/* topology reader config*/
 struct tplgreader {
 	const char *in_file;
 	const char *out_file;
 	FILE *in_fd;
 	FILE *out_fd;
+};
+
+
+/* topology reader pcm */
+struct tplgreaderpcm {
+	const char *pcm_name;
+	uint32_t index;
+	uint32_t id;
+	uint64_t formats;		/* SNDRV_PCM_FMTBIT_* */
+	uint32_t rates;			/* SNDRV_PCM_RATE_* */
+	uint32_t rate_min;		/* min rate */
+	uint32_t rate_max;		/* max rate */
+	uint32_t channels_min;		/* min channels */
+	uint32_t channels_max;		/* max channels */
+	uint32_t sig_bits;		/* number of bits of content */
+	uint32_t src;
+	uint32_t vol;
 };
 
 /* topology context */
@@ -39,6 +87,8 @@ struct soc_tplg {
 
 	uint32_t index;	/* current block index */
 	uint32_t req_index;	/* required index, only loaded/free matching blocks */
+
+	struct plist pcm_list;
 
 #if 0
 	/* component caller */
@@ -76,6 +126,79 @@ static inline unsigned long tplg_get_offset(struct soc_tplg *tplg)
 {
 	return (unsigned long)(tplg->pos - tplg->data);
 }
+
+static void set_pcm_info(struct tplgreaderpcm *pcm,
+	struct snd_soc_tplg_stream_caps *caps)
+{
+	pcm->pcm_name = strdup(caps->name);
+	pcm->channels_min = caps->channels_min;
+	pcm->channels_max = caps->channels_max;
+	pcm->rates = caps->rates;
+	pcm->rate_min = caps->rate_min;
+	pcm->rate_max = caps->rate_max;
+	pcm->formats = caps->formats;
+	pcm->sig_bits = caps->sig_bits;
+}
+
+struct tplg_format {
+	uint64_t fmt;
+	const char *name;
+};
+
+static const struct tplg_format tplg_formats[] = {
+	{SNDRV_PCM_FMTBIT_S16_LE, "s16le"},
+	{SNDRV_PCM_FMTBIT_S24_LE, "s24le"},
+	{SNDRV_PCM_FMTBIT_S32_LE, "s32le"},
+	{SNDRV_PCM_FMTBIT_FLOAT,  "float"},
+};
+
+static const char *find_format(uint64_t format)
+{
+	int i;
+
+	/* TODO: format is a bit wise field, which means there will be
+	 * multi format be supported. Expose all or one?
+	 */
+	for (i = 0; i < ARRAY_SIZE(tplg_formats); i++) {
+		if (tplg_formats[i].fmt & format)
+			return tplg_formats[i].name;
+	}
+
+	return NULL;
+}
+
+static void print_pcm_info(struct tplgreaderpcm *pcm)
+{
+	printf("PCM: [%s] ID %d FMT %s RATE_MIN %d RATE MAX %d SRC %d VOL %d\n",
+		pcm->pcm_name, pcm->id, find_format(pcm->formats),
+		pcm->rate_min, pcm->rate_max, pcm->src, pcm->vol);
+}
+
+static int tplgreader_pcm_create(struct soc_tplg *tplg,
+	struct snd_soc_tplg_pcm *pcm)
+{
+	struct snd_soc_tplg_stream_caps *caps;
+	struct tplgreaderpcm *trpcm;
+
+	/* we only want to dump pcm with playback and capture */
+	if (pcm->playback && pcm->capture) {
+		trpcm = malloc(sizeof(struct tplgreaderpcm));
+		if (trpcm == NULL)
+			return -ENOMEM;
+
+		list_append(&tplg->pcm_list, trpcm);
+
+		trpcm->id = pcm->pcm_id;
+		caps = &pcm->caps[SND_SOC_TPLG_STREAM_PLAYBACK];
+		set_pcm_info(trpcm, caps);
+#if DEBUG
+		print_pcm_info(trpcm);
+#endif
+	}
+
+	return 0;
+}
+
 #if 0
 /* validate header magic, size and type */
 static int soc_valid_header(struct soc_tplg *tplg,
@@ -147,8 +270,8 @@ static int soc_tplg_kcontrol_elems_load(struct soc_tplg *tplg,
 		return 0;
 	}
 
-	fprintf(stdout ,"===============================\n");
-	fprintf(stdout ,"KCON: adding %d kcontrols\n", hdr->count);
+	dprintf("===============================\n");
+	dprintf("KCON: adding %d kcontrols\n", hdr->count);
 
 #if 0
 	for (i = 0; i < hdr->count; i++) {
@@ -196,20 +319,37 @@ static int soc_tplg_dapm_graph_elems_load(struct soc_tplg *tplg,
 	//struct snd_soc_dapm_context *dapm = &tplg->comp->dapm;
 	//struct snd_soc_dapm_route route;
 	struct snd_soc_tplg_dapm_graph_elem *elem;
-	int count = hdr->count, i;
+	struct tplgreaderpcm *pcm = NULL;
+	struct tplgreaderpcm *tmp;
+	int count = hdr->count, i, j;
 
 	if (tplg->pass != SOC_TPLG_PASS_GRAPH) {
 		tplg->pos += hdr->size + hdr->payload_size;
 		return 0;
 	}
 
-	fprintf(stdout ,"===============================\n");
-	fprintf(stdout ,"dapm : index %d adding %d DAPM routes\n", tplg->index, count);
+	dprintf("===============================\n");
+	dprintf("dapm : index %d adding %d DAPM routes\n", tplg->index, count);
 	for (i = 0; i < count; i++) {
 		elem = (struct snd_soc_tplg_dapm_graph_elem *)tplg->pos;
 		tplg->pos += sizeof(struct snd_soc_tplg_dapm_graph_elem);
 
-		fprintf(stdout ,"route: '%s' -> '%s' -> '%s'\n", elem->source, elem->control, elem->sink);
+		dprintf("route: '%s' -> '%s' -> '%s'\n", elem->source, elem->control, elem->sink);
+
+		/* find if this dapm graph include is part for PCM */
+		for ( j = 0; j < tplg->pcm_list.n; j++)
+		{
+			tmp = (struct tplgreaderpcm *)tplg->pcm_list.ptrs[j];
+			if (!strcmp(tmp->pcm_name, elem->source))
+				pcm = tmp;
+		}
+
+
+		/* find if PGA or SRC is a part */
+		if (pcm && strstr(elem->source, "PGA"))
+			pcm->vol = 1;
+		if (pcm && strstr(elem->source, "SRC"))
+			pcm->src = 1;
 	}
 
 	return 0;
@@ -230,25 +370,25 @@ static int soc_tplg_dapm_widget_elems_load(struct soc_tplg *tplg,
 	if (tplg->pass != SOC_TPLG_PASS_WIDGET)
 		return 0;
 
-	fprintf(stdout ,"===============================\n");
-	fprintf(stdout ,"dapm : index %d adding %d DAPM widgets\n", tplg->index, count);
+	dprintf("===============================\n");
+	dprintf("widgets : index %d adding %d DAPM widgets\n", tplg->index, count);
 
 	for (j = 0; j < count; j++) {
 		w = (struct snd_soc_tplg_dapm_widget *) tplg->pos;
 
 		tplg->pos += (sizeof(struct snd_soc_tplg_dapm_widget) + w->priv.size);
 
-		fprintf(stdout ,"widget : '%s' '%s'\n",
+		dprintf("widget : '%s' '%s'\n",
 			w->name, w->sname);
 
 		if (w->num_kcontrols == 0) {
-			//fprintf(stdout ,"===============================\n");
-			//fprintf(stdout ,"\n");
+			//dprintf("===============================\n");
+			//dprintf("\n");
 			continue;
 		}
 
 		control_hdr = (struct snd_soc_tplg_ctl_hdr *)tplg->pos;
-		//fprintf(stdout ,"template %s has %d controls of type %x\n",
+		//dprintf("template %s has %d controls of type %x\n",
 			//w->name, w->num_kcontrols, control_hdr->type);
 		num_kcontrols = w->num_kcontrols;
 
@@ -263,7 +403,7 @@ static int soc_tplg_dapm_widget_elems_load(struct soc_tplg *tplg,
 				mc = (struct snd_soc_tplg_mixer_control *)tplg->pos;
 				tplg->pos += (sizeof(struct snd_soc_tplg_mixer_control) +
 					mc->priv.size);
-				fprintf(stdout ,"\tmixer control '%s'\n",
+				dprintf("\tmixer control '%s'\n",
 					mc->hdr.name);
 			}
 			break;
@@ -276,7 +416,7 @@ static int soc_tplg_dapm_widget_elems_load(struct soc_tplg *tplg,
 				ec = (struct snd_soc_tplg_enum_control *)tplg->pos;
 				tplg->pos += (sizeof(struct snd_soc_tplg_enum_control) +
 					ec->priv.size);
-				fprintf(stdout ,"\tenum control '%s'\n",
+				dprintf("\tenum control '%s'\n",
 					ec->hdr.name);
 			}
 			break;
@@ -285,7 +425,7 @@ static int soc_tplg_dapm_widget_elems_load(struct soc_tplg *tplg,
 				be = (struct snd_soc_tplg_bytes_control *)tplg->pos;
 				tplg->pos += (sizeof(struct snd_soc_tplg_bytes_control) +
 					be->priv.size);
-				fprintf(stdout ,"\tbytes control '%s' with access 0x%x\n",
+				dprintf("\tbytes control '%s' with access 0x%x\n",
 					be->hdr.name, be->hdr.access);
 			}
 			break;
@@ -415,28 +555,29 @@ static int soc_tplg_pcm_elems_load(struct soc_tplg *tplg,
 {
 	struct snd_soc_tplg_pcm *pcm, *_pcm;
 	int count = hdr->count;
+	int ret;
 	int i;
-	//bool abi_match;
 
 	if (tplg->pass != SOC_TPLG_PASS_PCM_DAI)
 		return 0;
 
-	fprintf(stdout ,"===============================\n");
-	fprintf(stdout ,"PCM: index %d adding %d PCM DAIs\n", tplg->index, count);
+	dprintf("===============================\n");
+	dprintf("PCM: index %d adding %d PCM DAIs\n", tplg->index, count);
 	for (i = 0; i < count; i++) {
 		pcm = (struct snd_soc_tplg_pcm *)tplg->pos;
 
-		/* create the FE DAIs and DAI links */
-		//soc_tplg_pcm_create(tplg, _pcm);
+		/* create the pcm */
+		ret = tplgreader_pcm_create(tplg ,pcm);
+		if (ret < 0)
+			return ret;
 
 		/* offset by version-specific struct size and
 		 * real priv data size
 		 */
-		tplg->pos += pcm->size + _pcm->priv.size;
-		fprintf(stdout ,"PCM: '%s' DAI: '%s'\n",pcm->pcm_name , pcm->dai_name);
+		tplg->pos += pcm->size + pcm->priv.size;
 
-		//if (!abi_match)
-			//kfree(_pcm); /* free the duplicated one */
+		/* output log */
+		dprintf("PCM: '%s' DAI: '%s'\n",pcm->pcm_name , pcm->dai_name);
 	}
 
 #if 0
@@ -499,8 +640,8 @@ static int soc_tplg_dai_elems_load(struct soc_tplg *tplg,
 		return 0;
 	}
 
-	fprintf(stdout ,"===============================\n");
-	fprintf(stdout ,"DAI: index %d adding %d BE DAIs\n", tplg->index, count);
+	dprintf("===============================\n");
+	dprintf("DAI: index %d adding %d BE DAIs\n", tplg->index, count);
 
 #if 0
 	/* config the existing BE DAIs */
@@ -531,13 +672,13 @@ static int soc_tplg_link_elems_load(struct soc_tplg *tplg,
 		tplg->pos += hdr->size + hdr->payload_size;
 		return 0;
 	};
-	fprintf(stdout ,"===============================\n");
-	fprintf(stdout ,"LINK: index %d adding %d links\n", tplg->index, count);
+	dprintf("===============================\n");
+	dprintf("LINK: index %d adding %d links\n", tplg->index, count);
 
 	for (i = 0; i < count; i++) {
 		link = (struct snd_soc_tplg_link_config *)tplg->pos;
 		tplg->pos += link->size + link->priv.size;
-		fprintf(stdout ,"LINK: Name '%s' stream name '%s' id %d\n", link->name,
+		dprintf("LINK: Name '%s' stream name '%s' id %d\n", link->name,
 				link->stream_name, link->id);
 	}
 #if 0
@@ -598,8 +739,9 @@ static int soc_tplg_manifest_load(struct soc_tplg *tplg,
 	if (tplg->pass != SOC_TPLG_PASS_MANIFEST)
 		return 0;
 
-	fprintf(stdout ,"===============================\n");
-	fprintf(stdout ,"Mainfest\n");
+	dprintf("===============================\n");
+	dprintf("Mainfest\n");
+
 #if 0
 	manifest = (struct snd_soc_tplg_manifest *)tplg->pos;
 
@@ -680,20 +822,13 @@ static int tplg_process_headers(struct soc_tplg *tplg)
 	/* process the header types from start to end */
 	while (tplg->pass <= SOC_TPLG_PASS_END) {
 
+		//printf("PXL DEBUG pass %d\n", tplg->pass);
+
 		tplg->hdr_pos = tplg->data;
 		hdr = (struct snd_soc_tplg_hdr *)tplg->hdr_pos;
 
 		while (!tplg_is_eof(tplg)) {
 
-#if 0
-			/* make sure header is valid before loading */
-			ret = soc_valid_header(tplg, hdr);
-			if (ret < 0)
-				return ret;
-			else if (ret == 0)
-				break;
-
-#endif
 			/* load the header object */
 			ret = soc_tplg_load_header(tplg, hdr);
 			if (ret < 0)
@@ -721,13 +856,14 @@ static int read_tplg_file(struct tplgreader *reader)
 	int ret = 0;
 	size_t filelen, count;
 	char* data;
+	int i;
 	
 	fseek(reader->in_fd, 0L, SEEK_END);
 	filelen = ftell(reader->in_fd);
 	rewind(reader->in_fd);
 	
 	data = (char*)malloc(sizeof(char) * filelen);  
-	fprintf(stdout, "Reader: read file size %zu\n", filelen);
+	dprintf("Reader: read file size %zu\n", filelen);
 
 	if (data == NULL)  
 	{
@@ -745,7 +881,17 @@ static int read_tplg_file(struct tplgreader *reader)
 
 	tplg.data = data;
 	tplg.size = filelen;
+	tplg.req_index = SND_SOC_TPLG_INDEX_ALL;
+	list_init(&tplg.pcm_list);
+
 	ret = tplg_process_headers(&tplg);
+
+	/* print out all PCM list */
+
+	for ( i = 0; i < tplg.pcm_list.n; i++)
+	{
+		print_pcm_info(tplg.pcm_list.ptrs[i]);
+	}
 
 	free(data);
 	return 0;
